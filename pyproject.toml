@@ -1,0 +1,52 @@
+[tool.poetry]
+name = "hrdintelligence-ai-service"
+version = "0.1.0"
+description = "HRD Intelligence AI Service (FastAPI): general chat, folder chat, RAG"
+authors = ["HRD Intelligence AI Team"]
+readme = "README.md"
+packages = [{ include = "app" }]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.13"
+fastapi = ">=0.110"
+uvicorn = { version = ">=0.29", extras = ["standard"] }
+pydantic-settings = ">=2.2"
+openai = ">=1.30"
+httpx = ">=0.27"                                    # used directly by app/llm/client.py
+sqlalchemy = { version = ">=2.0", extras = ["asyncio"] }  # database access (async)
+asyncpg = ">=0.29"                                  # PostgreSQL driver
+pyjwt = { version = ">=2.8", extras = ["crypto"] }  # verify Keycloak JWTs (RS256)
+pypdfium2 = ">=5.14"                                # PDF text layer + page rendering for OCR (7.4)
+python-docx = ">=1.2"                               # DOCX paragraphs and tables (7.4)
+pillow = ">=10.4"                                   # images; <11 required by Surya (7.4)
+pgvector = ">=0.4"                                  # VECTOR column type for ai.chunk_embeddings (7.5)
+boto3 = ">=1.34"                                    # read uploaded files from RustFS (S3-compatible) (7.6)
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=8.0"
+pytest-asyncio = ">=0.23"
+aiosqlite = ">=0.19"                                # tests use a temporary SQLite database
+cryptography = ">=42.0"                             # tests generate RSA keys to sign test tokens
+
+# Heavy local OCR models; install with: poetry install --with ocr
+[tool.poetry.group.ocr]
+optional = true
+
+[tool.poetry.group.ocr.dependencies]
+paddleocr = ">=3.7"
+paddlepaddle = ">=3.3"
+
+# Surya OCR (Khmer support; pulls in PyTorch); install with: poetry install --with surya
+# Licence: GPL-3.0 code, model weights under their own terms; confirm before deploying.
+[tool.poetry.group.surya]
+optional = true
+
+[tool.poetry.group.surya.dependencies]
+surya-ocr = "^0.22.1"
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[build-system]
+requires = ["poetry-core>=1.8"]
+build-backend = "poetry.core.masonry.api"

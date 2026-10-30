@@ -1,0 +1,26 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.idea/
+.vscode/
+dist/
+data/
+models/
+.env.*
+*.log
+
+# Claude Code: personal settings and isolated worktrees stay local
+.claude/settings.local.json
+.claude/worktrees/
+
+# Scratch files used for manual testing
+body.json
+diag_llm.py
+stream_check.py
+stream_long.py
+
+# macOS
+.DS_Store

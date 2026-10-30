@@ -1,0 +1,192 @@
+name: Telegram Notify
+
+# Sends GitHub push / pull request notifications to a Telegram group topic.
+# Setup guide: TELEGRAM_SETUP.md (repo root)
+#
+# Required secrets  (Settings > Secrets and variables > Actions > Secrets):
+#   TELEGRAM_BOT_TOKEN   token from BotFather
+#   TELEGRAM_CHAT_ID     group chat id, e.g. -1001234567890
+#   TELEGRAM_THREAD_ID   message_thread_id of the "Notification" topic
+#
+# Optional variables (Settings > Secrets and variables > Actions > Variables):
+#   PUSH_BRANCHES        comma-separated branches to announce pushes for.
+#                        Default: the repo's default branch. Use * for all branches.
+#   NOTIFY_MERGE_PUSHES  set to "true" to ALSO announce the push that a PR merge
+#                        creates (off by default to avoid duplicate messages).
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review, closed]
+
+# The job only reads the event payload and calls Telegram: no repo access needed.
+permissions: {}
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Send Telegram notification
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_THREAD_ID: ${{ secrets.TELEGRAM_THREAD_ID }}
+          PUSH_BRANCHES: ${{ vars.PUSH_BRANCHES }}
+          NOTIFY_MERGE_PUSHES: ${{ vars.NOTIFY_MERGE_PUSHES }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+
+          # Untrusted text (commit messages, PR titles) is only ever read from the
+          # event JSON file by jq, never interpolated into this shell script.
+          EVENT_FILE="${GITHUB_EVENT_PATH}"
+
+          if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then
+            echo "::error::TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID secrets must be set (see TELEGRAM_SETUP.md)."
+            exit 1
+          fi
+
+          JQ_COMMON='def esc: gsub("&";"&amp;") | gsub("<";"&lt;") | gsub(">";"&gt;");'
+
+          # ---------------------------------------------------------------- push
+          build_push() {
+            local branch="${REF#refs/heads/}"
+
+            if [[ "$(jq -r '.deleted // false' "$EVENT_FILE")" == "true" ]]; then
+              echo "Branch deletion, skipping." >&2; return 1
+            fi
+            if [[ "$(jq -r '.commits | length' "$EVENT_FILE")" == "0" ]]; then
+              echo "Push has no commits, skipping." >&2; return 1
+            fi
+
+            # Only announce pushes for allowed branches (default: default branch).
+            local allowed="${PUSH_BRANCHES:-$DEFAULT_BRANCH}" ok=false b
+            IFS=',' read -ra list <<< "$allowed"
+            for b in "${list[@]}"; do
+              b="${b// /}"
+              if [[ "$b" == "*" || "$b" == "$branch" ]]; then ok=true; break; fi
+            done
+            if [[ "$ok" != true ]]; then
+              echo "Branch '$branch' not in PUSH_BRANCHES ($allowed), skipping." >&2; return 1
+            fi
+
+            # Skip the push created by merging a PR; the PR "merged" message covers it.
+            if [[ "${NOTIFY_MERGE_PUSHES:-false}" != "true" ]]; then
+              local subject re_merge re_squash
+              subject="$(jq -r '(.head_commit.message // "") | split("\n")[0]' "$EVENT_FILE")"
+              re_merge='^Merge pull request #[0-9]+'
+              re_squash='\(#[0-9]+\)$'
+              if [[ "$subject" =~ $re_merge || "$subject" =~ $re_squash ]]; then
+                echo "Push looks like a PR merge, skipping (set NOTIFY_MERGE_PUSHES=true to keep)." >&2; return 1
+              fi
+            fi
+
+            local prog
+            prog="$(cat <<'JQ'
+          (.commits | length) as $n
+          | ((.pusher.name // .sender.login // "unknown") | esc) as $who
+          | (if .forced then " (force-pushed)" else "" end) as $force
+          | "🔨 <b>\($n) new commit\(if $n == 1 then "" else "s" end)</b> on <code>\($branch | esc)</code>\($force)\n"
+            + "📦 <a href=\"\(.repository.html_url)\">\(.repository.full_name | esc)</a>\n"
+            + "👤 \($who)\n\n"
+            + ([.commits[:15][]
+                | "• <a href=\"\(.url)\"><code>\(.id[0:7])</code></a> "
+                  + ((.message | split("\n")[0])[0:100] | esc)
+                  + " — <i>\((.author.name // .author.username // "unknown") | esc)</i>"
+               ] | join("\n"))
+            + (if $n > 15 then "\n… and \($n - 15) more" else "" end)
+            + "\n\n<a href=\"\(.compare)\">View changes</a>"
+          JQ
+          )"
+            jq -r --arg branch "$branch" "$JQ_COMMON $prog" "$EVENT_FILE"
+          }
+
+          # --------------------------------------------------------- pull_request
+          build_pr() {
+            local prog
+            prog="$(cat <<'JQ'
+          .action as $a
+          | .pull_request as $pr
+          | ($pr.merged // false) as $merged
+          | (if $a == "opened" then "🟢 <b>Pull request opened</b>"
+             elif $a == "reopened" then "🔄 <b>Pull request reopened</b>"
+             elif $a == "ready_for_review" then "👀 <b>Pull request ready for review</b>"
+             elif $a == "synchronize" then "🔁 <b>Pull request updated</b>"
+             elif $a == "closed" and $merged then "🟣 <b>Pull request merged</b>"
+             else "🔴 <b>Pull request closed without merging</b>" end) as $head
+          | $head + (if $pr.draft then " (draft)" else "" end) + "\n"
+            + "📦 <a href=\"\(.repository.html_url)\">\(.repository.full_name | esc)</a>\n\n"
+            + "<a href=\"\($pr.html_url)\">#\($pr.number) \($pr.title | esc)</a>\n"
+            + "👤 Author: \($pr.user.login | esc)\n"
+            + (if $merged then "🔀 Merged by: \(($pr.merged_by.login // .sender.login) | esc)\n"
+               elif $a == "closed" then "✖️ Closed by: \(.sender.login | esc)\n"
+               elif $a == "synchronize" then "⬆️ Updated by: \(.sender.login | esc)\n"
+               else "" end)
+            + "🌿 <code>\($pr.head.ref | esc)</code> → <code>\($pr.base.ref | esc)</code>"
+            + (if $a == "synchronize"
+               then "\n🔹 Latest commit: <a href=\"\($pr.html_url)/commits/\($pr.head.sha)\"><code>\($pr.head.sha[0:7])</code></a>"
+               else "" end)
+          JQ
+          )"
+            jq -r "$JQ_COMMON $prog" "$EVENT_FILE"
+          }
+
+          # ------------------------------------------------------------- dispatch
+          case "$EVENT_NAME" in
+            push)         MESSAGE="$(build_push)" || exit 0 ;;
+            pull_request) MESSAGE="$(build_pr)" ;;
+            *) echo "Unsupported event: $EVENT_NAME"; exit 0 ;;
+          esac
+
+          # Telegram hard limit is 4096 characters. Each item is already truncated,
+          # but cut at a line boundary as a last-resort safety net.
+          if (( ${#MESSAGE} > 4000 )); then
+            MESSAGE="$(printf '%s' "${MESSAGE:0:3900}" | sed '$d')"$'\n'"… (message truncated)"
+          fi
+
+          if [[ "${TELEGRAM_DRY_RUN:-}" == "1" ]]; then
+            echo "----- DRY RUN -----"; printf '%s\n' "$MESSAGE"; exit 0
+          fi
+
+          # ----------------------------------------------------------------- send
+          args=(
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}"
+            --data-urlencode "text=${MESSAGE}"
+            --data-urlencode "parse_mode=HTML"
+            --data-urlencode "disable_web_page_preview=true"
+          )
+          # Route to the forum topic. Omitted if empty (works for non-topic groups).
+          if [[ -n "${TELEGRAM_THREAD_ID:-}" ]]; then
+            args+=(--data-urlencode "message_thread_id=${TELEGRAM_THREAD_ID}")
+          fi
+
+          resp="$(mktemp)"
+          for attempt in 1 2 3; do
+            code="$(curl -sS --max-time 20 -o "$resp" -w '%{http_code}' -X POST \
+              "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" "${args[@]}" || echo 000)"
+
+            if [[ "$code" == "200" ]]; then
+              echo "Notification sent."; exit 0
+            fi
+
+            desc="$(jq -r '.description // "no description"' "$resp" 2>/dev/null || echo "unreadable response")"
+            if [[ "$code" == "429" ]]; then
+              wait="$(jq -r '.parameters.retry_after // 5' "$resp" 2>/dev/null || echo 5)"
+              echo "Rate limited, retrying in ${wait}s (attempt $attempt/3)."
+              sleep "$wait"; continue
+            fi
+            if [[ "$code" == "000" || "$code" -ge 500 ]]; then
+              echo "Transient error (HTTP $code), retrying (attempt $attempt/3)."
+              sleep 3; continue
+            fi
+
+            echo "::error::Telegram API error (HTTP $code): $desc"
+            exit 1
+          done
+
+          echo "::error::Failed to send Telegram notification after 3 attempts."
+          exit 1
